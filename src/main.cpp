@@ -11,8 +11,47 @@
 #include <sys/mman.h>
 
 #define TAG "NPCFight"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// ============================================================
+// FILE LOGGER — tulis ke /sdcard/npcfight_log.txt
+// Untuk device tanpa root (tidak bisa baca logcat dari Termux)
+// ============================================================
+
+static const char* LOG_FILE = "/sdcard/npcfight_log.txt";
+static int g_logLine = 0;
+
+static void fileLog(const char* level, const char* fmt, ...) {
+    FILE* f = fopen(LOG_FILE, "a");
+    if (!f) return;
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    fprintf(f, "[%s][%d] %s\n", level, g_logLine++, buf);
+    fflush(f);
+    fclose(f);
+}
+
+static void logClear() {
+    remove(LOG_FILE);
+    FILE* f = fopen(LOG_FILE, "w");
+    if (f) {
+        fprintf(f, "=== NPCFight Log Start ===\n");
+        fclose(f);
+    }
+}
+
+// Macro — tulis ke logcat DAN ke file sekaligus
+#define LOGI(fmt, ...) do { \
+    __android_log_print(ANDROID_LOG_INFO,  TAG, fmt, ##__VA_ARGS__); \
+    fileLog("I", fmt, ##__VA_ARGS__); \
+} while(0)
+
+#define LOGE(fmt, ...) do { \
+    __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, ##__VA_ARGS__); \
+    fileLog("E", fmt, ##__VA_ARGS__); \
+} while(0)
 
 // ============================================================
 // OFFSETS — libGTASA.so armeabi-v7a (versi ini)
@@ -152,24 +191,36 @@ static float getPedHealth(void* ped) {
 static void assignKillTask(void* attacker, void* target) {
     if (!attacker || !target) return;
 
+    void* intel = *(void**)((uintptr_t)attacker + OFFSET_PED_INTELLIGENCE);
+    LOGI("assignKillTask: attacker=0x%08x intel=0x%08x target=0x%08x",
+         (unsigned)(uintptr_t)attacker,
+         (unsigned)(uintptr_t)intel,
+         (unsigned)(uintptr_t)target);
+
     void* taskMgr = getTaskManager(attacker);
-    if (!taskMgr) return;
+    if (!taskMgr) {
+        LOGE("assignKillTask: taskMgr null! OFFSET_PED_INTELLIGENCE=0x%x mungkin salah",
+             OFFSET_PED_INTELLIGENCE);
+        return;
+    }
 
     // Alokasi task object di heap
-    // Size CTaskComplexKillPedOnFootArmed dari re3 ~= 0x44 bytes
     void* taskMem = malloc(0x80);
-    if (!taskMem) return;
+    if (!taskMem) { LOGE("assignKillTask: malloc gagal"); return; }
     memset(taskMem, 0, 0x80);
+    LOGI("assignKillTask: taskMem=0x%08x", (unsigned)(uintptr_t)taskMem);
 
     // Construct task
     auto taskCtor = getFunc<TaskKillPedOnFootArmed_ctor_t>(OFF_TaskKillPedOnFootArmed_ctor);
+    LOGI("assignKillTask: memanggil task ctor di 0x%08x",
+         (unsigned)(uintptr_t)taskCtor);
     taskCtor(taskMem, target, 0, 0, 0, 0);
+    LOGI("assignKillTask: task ctor selesai");
 
     // Assign ke slot PRIMARY (slot 0)
     auto setTask = getFunc<CTaskManager_SetTask_t>(OFF_CTaskManager_SetTask);
     setTask(taskMgr, taskMem, 0, true);
-
-    LOGI("Assigned kill task: attacker=%p -> target=%p", attacker, target);
+    LOGI("assignKillTask: SetTask selesai OK");
 }
 
 // ============================================================
@@ -177,12 +228,14 @@ static void assignKillTask(void* attacker, void* target) {
 // ============================================================
 
 static void spawnNPC(int modelId, int weaponId) {
+    LOGI("spawnNPC: model=%d weapon=%d", modelId, weaponId);
     auto findPlayer = getFunc<FindPlayerPed_t>(OFF_FindPlayerPed);
     void* playerPed = findPlayer(0);
     if (!playerPed) {
-        LOGE("spawnNPC: playerPed null");
+        LOGE("spawnNPC: playerPed null — game belum spawn player?");
         return;
     }
+    LOGI("spawnNPC: playerPed=0x%08x", (unsigned)(uintptr_t)playerPed);
 
     float px, py, pz;
     getPedPosition(playerPed, &px, &py, &pz);
@@ -196,17 +249,18 @@ static void spawnNPC(int modelId, int weaponId) {
         pz
     };
 
-    // Spawn ped
-    // CPopulation::AddPed(ePedType=4 (CIVMALE), modelId, pos, false)
+    LOGI("spawnNPC: player pos=(%.1f, %.1f, %.1f)", px, py, pz);
+    LOGI("spawnNPC: spawn pos=(%.1f, %.1f, %.1f) angle=%.1f dist=%.1f",
+         spawnPos[0], spawnPos[1], spawnPos[2], angle, dist);
+
     auto addPed = getFunc<CPopulation_AddPed_t>(OFF_CPopulation_AddPed);
     void* newPed = addPed(4, modelId, spawnPos, false);
 
     if (!newPed) {
-        LOGE("spawnNPC: AddPed returned null");
+        LOGE("spawnNPC: AddPed returned null — model invalid atau pool penuh?");
         return;
     }
-
-    LOGI("Spawned NPC: ped=%p model=%d", newPed, modelId);
+    LOGI("spawnNPC: AddPed OK, newPed=0x%08x", (unsigned)(uintptr_t)newPed);
 
     // Kasih senjata
     auto giveWeapon = getFunc<CPed_GiveWeapon_t>(OFF_CPed_GiveWeapon);
@@ -243,6 +297,8 @@ static void spawnNPC(int modelId, int weaponId) {
 
 static void monitorNPCs() {
     pthread_mutex_lock(&g_npcMutex);
+    int total = (int)g_npcList.size();
+    LOGI("monitorNPCs: total NPC=%d", total);
 
     // Hapus NPC yang sudah mati dari list
     for (int i = (int)g_npcList.size() - 1; i >= 0; i--) {
@@ -286,9 +342,9 @@ static void checkFileCommand() {
     char line[64] = {0};
     fgets(line, sizeof(line), f);
     fclose(f);
-
-    // Hapus file setelah dibaca agar tidak trigger ulang
     remove(cmdFile);
+
+    LOGI("checkFileCommand: dapat command='%s'", line);
 
     // Parse command
     if (strncmp(line, "clear", 5) == 0) {
@@ -401,6 +457,8 @@ static bool hookCGameProcess() {
     patch[2] = 0xF0; patch[3] = 0x00;
     *(uintptr_t*)(patch + 4) = hookAddr;
 
+    LOGI("hookCGameProcess: patch di 0x%08x -> hook 0x%08x",
+         (unsigned)patchAddr, (unsigned)hookAddr);
     memcpy((void*)patchAddr, patch, 8);
 
     // Cache flush
@@ -416,15 +474,20 @@ static bool hookCGameProcess() {
 // ============================================================
 
 extern "C" void OnModLoad() {
-    LOGI("NPCFight OnModLoad dipanggil");
+    logClear();
+    LOGI("OnModLoad dipanggil");
+    LOGI("Compiled: %s %s", __DATE__, __TIME__);
 
     // Cari base libGTASA.so
     g_gtasaBase = getLibraryBase("libGTASA.so");
     if (!g_gtasaBase) {
-        LOGE("Gagal dapat base libGTASA.so");
+        LOGE("GAGAL: base libGTASA.so tidak ditemukan");
         return;
     }
-    LOGI("libGTASA.so base: 0x%x", (unsigned)g_gtasaBase);
+    LOGI("libGTASA.so base: 0x%08x", (unsigned)g_gtasaBase);
+    LOGI("CGame::Process addr: 0x%08x", (unsigned)(g_gtasaBase + OFF_CGame_Process));
+    LOGI("FindPlayerPed addr:  0x%08x", (unsigned)(g_gtasaBase + OFF_FindPlayerPed));
+    LOGI("AddPed addr:         0x%08x", (unsigned)(g_gtasaBase + OFF_CPopulation_AddPed));
 
     srand(12345);
 
