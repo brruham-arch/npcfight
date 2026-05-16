@@ -1,4 +1,6 @@
-#include <jni.h>
+#include <mod/amlmod.h>
+#include <mod/logger.h>
+
 #include <android/log.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -10,14 +12,20 @@
 #include <stdint.h>
 #include <sys/mman.h>
 
-#define TAG "NPCFight"
+// ============================================================
+// AML mod registration — WAJIB pakai macro ini, bukan struct manual
+// MYMOD otomatis export __GetModInfo() dengan layout yang benar
+// ============================================================
+MYMOD(com.brruham.npcfight, NPC Fight, 1.0, brruham)
+NEEDGAME(com.rockstargames.gtasa)
 
 // ============================================================
-// FILE LOGGER — tulis ke /sdcard/npcfight_log.txt
-// Untuk device tanpa root (tidak bisa baca logcat dari Termux)
+// FILE LOGGER
 // ============================================================
 
-static const char* LOG_FILE = "/storage/emulated/0/Android_unprotected/data/com.rockstargames.gtasa/files/npcfight_log.txt";
+static const char* LOG_FILE =
+    "/storage/emulated/0/Android_unprotected/data/"
+    "com.rockstargames.gtasa/files/npcfight_log.txt";
 static int g_logLine = 0;
 
 static void fileLog(const char* level, const char* fmt, ...) {
@@ -36,289 +44,205 @@ static void fileLog(const char* level, const char* fmt, ...) {
 static void logClear() {
     remove(LOG_FILE);
     FILE* f = fopen(LOG_FILE, "w");
-    if (f) {
-        fprintf(f, "=== NPCFight Log Start ===\n");
-        fclose(f);
-    }
+    if (f) { fprintf(f, "=== NPCFight Log Start ===\n"); fclose(f); }
 }
 
-// Macro — tulis ke logcat DAN ke file sekaligus
 #define LOGI(fmt, ...) do { \
-    __android_log_print(ANDROID_LOG_INFO,  TAG, fmt, ##__VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_INFO,  "NPCFight", fmt, ##__VA_ARGS__); \
     fileLog("I", fmt, ##__VA_ARGS__); \
 } while(0)
 
 #define LOGE(fmt, ...) do { \
-    __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, ##__VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_ERROR, "NPCFight", fmt, ##__VA_ARGS__); \
     fileLog("E", fmt, ##__VA_ARGS__); \
 } while(0)
 
 // ============================================================
-// OFFSETS — libGTASA.so armeabi-v7a (versi ini)
+// OFFSETS — libGTASA.so armeabi-v7a
 // ============================================================
 
-// Semua offset ini adalah offset dari base libGTASA.so
-// Diambil dari hasil nm -D libGTASA.so
+#define OFF_FindPlayerPed               0x0040b288
+#define OFF_CPopulation_AddPed          0x004cf26c
+#define OFF_CPed_GiveWeapon             0x0049f518
+#define OFF_CTaskManager_SetTask        0x0053390a
+#define OFF_CGame_Process               0x003f3fb0
+#define OFF_TaskKillPedOnFootArmed_ctor 0x004e2520
+#define OFF_CPedIntelligence_ClearTasks 0x004c08ec
 
-#define OFF_FindPlayerPed           0x0040b288  // FindPlayerPed(int)
-#define OFF_CPopulation_AddPed      0x004cf26c  // CPopulation::AddPed(ePedType, modelId, CVector&, bool)
-#define OFF_CPed_GiveWeapon         0x0049f518  // CPed::GiveWeapon(eWeaponType, ammo, bool)
-#define OFF_CTaskManager_SetTask    0x0053390a  // CTaskManager::SetTask(CTask*, int, bool)
-#define OFF_CGame_Process           0x003f3fb0  // CGame::Process()
+#define OFFSET_PED_INTELLIGENCE     0x47C
+#define OFFSET_PED_POSITION         0x14
+#define OFFSET_PED_HEALTH           0x540
 
-// Task constructors
-#define OFF_TaskKillPedOnFoot_ctor      0x004e01b0  // CTaskComplexKillPedOnFoot(CPed*, i,j,j,j,i)
-#define OFF_TaskKillPedOnFootArmed_ctor 0x004e2520  // CTaskComplexKillPedOnFootArmed(CPed*, j,j,j,i)
-#define OFF_TaskKillPedOnFootMelee_ctor 0x004e17cc  // CTaskComplexKillPedOnFootMelee(CPed*)
-#define OFF_TaskSimpleFight_ctor        0x004d86b0  // CTaskSimpleFight(CEntity*, i, j)
+#define WEAPON_PISTOL   22
+#define WEAPON_SHOTGUN  25
+#define WEAPON_AK47     30
+#define WEAPON_M4       31
 
-// CPedIntelligence
-#define OFF_CPedIntelligence_ClearTasks 0x004c08ec  // CPedIntelligence::ClearTasks(bool, bool)
-
-// Struct offsets (dari re3 Android, perlu verifikasi)
-#define OFFSET_PED_INTELLIGENCE     0x47C   // CPed::m_pIntelligence
-#define OFFSET_PED_POSITION         0x14    // CPed/CPhysical::m_placement -> CVector pos
-
-// Weapon IDs (eWeaponType)
-#define WEAPON_FIST         0
-#define WEAPON_PISTOL       22
-#define WEAPON_SHOTGUN      25
-#define WEAPON_AK47         30
-#define WEAPON_M4           31
-#define WEAPON_KNIFE        4
-
-// Ped model IDs
 #define MODEL_COP       265
 #define MODEL_SWAT      267
 #define MODEL_ARMY      287
 #define MODEL_BALLAS    102
 #define MODEL_GROVE     105
-#define MODEL_VAGOS     114
 
 // ============================================================
-// TYPEDEFS — function pointer ke fungsi libGTASA
+// TYPEDEFS
 // ============================================================
 
-typedef void* (*FindPlayerPed_t)(int playerIndex);
-typedef void* (*CPopulation_AddPed_t)(int pedType, int modelId, float* pos, bool unknown);
-typedef void  (*CPed_GiveWeapon_t)(void* ped, int weaponType, int ammo, bool unknown);
-typedef void  (*CTaskManager_SetTask_t)(void* taskMgr, void* task, int slot, bool forceNewTask);
+typedef void* (*FindPlayerPed_t)(int);
+typedef void* (*CPopulation_AddPed_t)(int, int, float*, bool);
+typedef void  (*CPed_GiveWeapon_t)(void*, int, int, bool);
+typedef void  (*CTaskManager_SetTask_t)(void*, void*, int, bool);
 typedef void  (*CGame_Process_t)();
-typedef void* (*TaskKillPedOnFootMelee_ctor_t)(void* task, void* targetPed);
-typedef void* (*TaskKillPedOnFootArmed_ctor_t)(void* task, void* targetPed, unsigned int flags1, unsigned int flags2, unsigned int flags3, int unknown);
-typedef void  (*CPedIntelligence_ClearTasks_t)(void* intel, bool bForceRestart, bool bClearScriptTask);
+typedef void* (*TaskKillPedOnFootArmed_ctor_t)(void*, void*, unsigned, unsigned, unsigned, int);
 
 // ============================================================
-// GLOBAL STATE
+// GLOBALS
 // ============================================================
 
 static uintptr_t g_gtasaBase = 0;
-static bool g_initialized = false;
-static bool g_hooked = false;
+static bool      g_initialized = false;
 
-// Daftar NPC yang sudah di-spawn
-// Simpan sebagai raw pointer — perlu validasi sebelum akses
-struct NPCEntry {
-    void* ped;
-    int   modelId;
-    int   weaponId;
-};
-
+struct NPCEntry { void* ped; int modelId; int weaponId; };
 static std::vector<NPCEntry> g_npcList;
-static pthread_mutex_t g_npcMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t       g_npcMutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Counter frame untuk polling (tidak tiap frame agar tidak berat)
 static int g_frameCounter = 0;
-static int g_spawnRequest = 0;  // > 0 berarti ada request spawn
 static int g_spawnModel   = MODEL_COP;
 static int g_spawnWeapon  = WEAPON_AK47;
 
-// Dobby hook — original CGame::Process
+// Original CGame::Process — diisi oleh aml->Hook()
 static CGame_Process_t g_origCGameProcess = nullptr;
 
 // ============================================================
-// HELPER: Dapat fungsi pointer dari offset
+// HELPER: function pointer dari offset (Thumb: +1)
 // ============================================================
 
 template<typename T>
-static T getFunc(uintptr_t offset) {
-    // ARM Thumb: bit0 = 1 untuk Thumb mode
-    // Fungsi di .text section ini Thumb, jadi tambah +1
+static inline T getFunc(uintptr_t offset) {
     return (T)(g_gtasaBase + offset + 1);
 }
 
 // ============================================================
-// HELPER: Dapat pointer ke CTaskManager dari CPed
-// ============================================================
-
-static void* getTaskManager(void* ped) {
-    if (!ped) return nullptr;
-    // CPed::m_pIntelligence ada di offset 0x47C
-    void* intel = *(void**)((uintptr_t)ped + OFFSET_PED_INTELLIGENCE);
-    if (!intel) return nullptr;
-    // CTaskManager ada di awal CPedIntelligence (offset 0x0)
-    return intel;  // m_TaskMgr adalah member pertama
-}
-
-// ============================================================
-// HELPER: Dapat posisi CPed
+// HELPER: baca posisi ped
 // ============================================================
 
 static void getPedPosition(void* ped, float* x, float* y, float* z) {
     if (!ped) { *x = *y = *z = 0; return; }
     float* pos = (float*)((uintptr_t)ped + OFFSET_PED_POSITION);
-    *x = pos[0];
-    *y = pos[1];
-    *z = pos[2];
+    *x = pos[0]; *y = pos[1]; *z = pos[2];
 }
 
 // ============================================================
-// HELPER: Cek apakah ped masih hidup (health > 0)
-// Health ada di CPed::m_fHealth — offset dari re3: 0x540
+// HELPER: baca health ped
 // ============================================================
 
-#define OFFSET_PED_HEALTH   0x540
-
-static float getPedHealth(void* ped) {
+static inline float getPedHealth(void* ped) {
     if (!ped) return 0.0f;
     return *(float*)((uintptr_t)ped + OFFSET_PED_HEALTH);
 }
 
 // ============================================================
-// CORE: Assign task "bunuh target" ke ped
+// HELPER: ambil TaskManager dari ped
+// ============================================================
+
+static void* getTaskManager(void* ped) {
+    if (!ped) return nullptr;
+    void* intel = *(void**)((uintptr_t)ped + OFFSET_PED_INTELLIGENCE);
+    if (!intel) return nullptr;
+    return intel; // CTaskManager adalah member pertama CPedIntelligence
+}
+
+// ============================================================
+// CORE: assign task bunuh target ke attacker
 // ============================================================
 
 static void assignKillTask(void* attacker, void* target) {
     if (!attacker || !target) return;
 
-    void* intel = *(void**)((uintptr_t)attacker + OFFSET_PED_INTELLIGENCE);
-    LOGI("assignKillTask: attacker=0x%08x intel=0x%08x target=0x%08x",
-         (unsigned)(uintptr_t)attacker,
-         (unsigned)(uintptr_t)intel,
-         (unsigned)(uintptr_t)target);
-
     void* taskMgr = getTaskManager(attacker);
     if (!taskMgr) {
-        LOGE("assignKillTask: taskMgr null! OFFSET_PED_INTELLIGENCE=0x%x mungkin salah",
+        LOGE("assignKillTask: taskMgr null — OFFSET_PED_INTELLIGENCE=0x%x mungkin salah",
              OFFSET_PED_INTELLIGENCE);
         return;
     }
 
-    // Alokasi task object di heap
+    // Alokasi dan construct task object
     void* taskMem = malloc(0x80);
     if (!taskMem) { LOGE("assignKillTask: malloc gagal"); return; }
     memset(taskMem, 0, 0x80);
-    LOGI("assignKillTask: taskMem=0x%08x", (unsigned)(uintptr_t)taskMem);
 
-    // Construct task
     auto taskCtor = getFunc<TaskKillPedOnFootArmed_ctor_t>(OFF_TaskKillPedOnFootArmed_ctor);
-    LOGI("assignKillTask: memanggil task ctor di 0x%08x",
-         (unsigned)(uintptr_t)taskCtor);
     taskCtor(taskMem, target, 0, 0, 0, 0);
-    LOGI("assignKillTask: task ctor selesai");
 
-    // Assign ke slot PRIMARY (slot 0)
     auto setTask = getFunc<CTaskManager_SetTask_t>(OFF_CTaskManager_SetTask);
     setTask(taskMgr, taskMem, 0, true);
-    LOGI("assignKillTask: SetTask selesai OK");
 }
 
 // ============================================================
-// CORE: Spawn satu NPC di sekitar player
+// CORE: spawn satu NPC di sekitar player
 // ============================================================
 
 static void spawnNPC(int modelId, int weaponId) {
     LOGI("spawnNPC: model=%d weapon=%d", modelId, weaponId);
+
     auto findPlayer = getFunc<FindPlayerPed_t>(OFF_FindPlayerPed);
     void* playerPed = findPlayer(0);
-    if (!playerPed) {
-        LOGE("spawnNPC: playerPed null — game belum spawn player?");
-        return;
-    }
-    LOGI("spawnNPC: playerPed=0x%08x", (unsigned)(uintptr_t)playerPed);
+    if (!playerPed) { LOGE("spawnNPC: playerPed null"); return; }
 
     float px, py, pz;
     getPedPosition(playerPed, &px, &py, &pz);
 
-    // Random offset 4-7 meter dari player
-    float angle = ((float)(rand() % 360)) * 3.14159f / 180.0f;
-    float dist  = 4.0f + (float)(rand() % 3);
-    float spawnPos[3] = {
-        px + cosf(angle) * dist,
-        py + sinf(angle) * dist,
-        pz
-    };
+    float angle   = ((float)(rand() % 360)) * 3.14159f / 180.0f;
+    float dist    = 4.0f + (float)(rand() % 3);
+    float pos[3]  = { px + cosf(angle) * dist, py + sinf(angle) * dist, pz };
 
-    LOGI("spawnNPC: player pos=(%.1f, %.1f, %.1f)", px, py, pz);
-    LOGI("spawnNPC: spawn pos=(%.1f, %.1f, %.1f) angle=%.1f dist=%.1f",
-         spawnPos[0], spawnPos[1], spawnPos[2], angle, dist);
+    LOGI("spawnNPC: player=(%.1f,%.1f,%.1f) spawn=(%.1f,%.1f,%.1f)",
+         px, py, pz, pos[0], pos[1], pos[2]);
 
     auto addPed = getFunc<CPopulation_AddPed_t>(OFF_CPopulation_AddPed);
-    void* newPed = addPed(4, modelId, spawnPos, false);
+    void* newPed = addPed(4, modelId, pos, false);
+    if (!newPed) { LOGE("spawnNPC: AddPed null — model invalid atau pool penuh"); return; }
+    LOGI("spawnNPC: newPed=0x%08x", (unsigned)(uintptr_t)newPed);
 
-    if (!newPed) {
-        LOGE("spawnNPC: AddPed returned null — model invalid atau pool penuh?");
-        return;
-    }
-    LOGI("spawnNPC: AddPed OK, newPed=0x%08x", (unsigned)(uintptr_t)newPed);
-
-    // Kasih senjata
     auto giveWeapon = getFunc<CPed_GiveWeapon_t>(OFF_CPed_GiveWeapon);
     giveWeapon(newPed, weaponId, 300, false);
 
     pthread_mutex_lock(&g_npcMutex);
 
-    // NPC baru menyerang semua NPC lama
-    for (auto& entry : g_npcList) {
-        if (getPedHealth(entry.ped) > 0.0f) {
-            assignKillTask(newPed, entry.ped);
-            // NPC lama juga menyerang NPC baru
-            assignKillTask(entry.ped, newPed);
-            // Cukup assign ke target pertama yang hidup untuk sekarang
-            // Retarget logic ada di monitor
+    // NPC baru <-> NPC lama saling serang
+    for (auto& e : g_npcList) {
+        if (getPedHealth(e.ped) > 0.0f) {
+            assignKillTask(newPed, e.ped);
+            assignKillTask(e.ped, newPed);
             break;
         }
     }
 
-    // Masuk list
-    NPCEntry entry;
-    entry.ped      = newPed;
-    entry.modelId  = modelId;
-    entry.weaponId = weaponId;
-    g_npcList.push_back(entry);
-
+    g_npcList.push_back({ newPed, modelId, weaponId });
     pthread_mutex_unlock(&g_npcMutex);
+    LOGI("spawnNPC: selesai, total NPC=%d", (int)g_npcList.size());
 }
 
 // ============================================================
-// CORE: Monitor NPC — cek mati, retarget
-// Dipanggil setiap ~60 frame (~1 detik)
+// CORE: monitor — hapus NPC mati, retarget yang hidup
 // ============================================================
 
 static void monitorNPCs() {
     pthread_mutex_lock(&g_npcMutex);
-    int total = (int)g_npcList.size();
-    LOGI("monitorNPCs: total NPC=%d", total);
 
-    // Hapus NPC yang sudah mati dari list
+    // Hapus yang mati
     for (int i = (int)g_npcList.size() - 1; i >= 0; i--) {
         if (getPedHealth(g_npcList[i].ped) <= 0.0f) {
-            LOGI("NPC mati: ped=%p, hapus dari list", g_npcList[i].ped);
+            LOGI("NPC mati, hapus index=%d", i);
             g_npcList.erase(g_npcList.begin() + i);
         }
     }
 
-    // Retarget: setiap NPC yang hidup assign attack ke NPC lain yang hidup
-    // Sederhana: NPC[i] attack NPC[i+1], NPC terakhir attack NPC[0]
+    // Retarget ring: NPC[i] attack NPC[i+1]
     int count = (int)g_npcList.size();
     if (count >= 2) {
         for (int i = 0; i < count; i++) {
-            int targetIdx = (i + 1) % count;
-            void* attacker = g_npcList[i].ped;
-            void* target   = g_npcList[targetIdx].ped;
-            if (attacker && target) {
-                assignKillTask(attacker, target);
-            }
+            assignKillTask(g_npcList[i].ped, g_npcList[(i + 1) % count].ped);
         }
     }
 
@@ -326,27 +250,23 @@ static void monitorNPCs() {
 }
 
 // ============================================================
-// TRIGGER: Baca file command
-// Format file /sdcard/npcfight.txt:
-//   "spawn"        → spawn NPC dengan model/weapon default
-//   "spawn 267"    → spawn model 267 (SWAT)
-//   "spawn 267 30" → spawn model 267, weapon 30 (AK47)
-//   "clear"        → hapus semua NPC dari list (tidak kill)
+// TRIGGER: baca file command
+// Format: "spawn [modelId] [weaponId]" atau "clear"
 // ============================================================
 
-static void checkFileCommand() {
-    const char* cmdFile = "/storage/emulated/0/Android_unprotected/data/com.rockstargames.gtasa/files/npcfight.txt";
-    FILE* f = fopen(cmdFile, "r");
-    if (!f) return;
+static const char* CMD_FILE =
+    "/storage/emulated/0/Android_unprotected/data/"
+    "com.rockstargames.gtasa/files/npcfight.txt";
 
+static void checkFileCommand() {
+    FILE* f = fopen(CMD_FILE, "r");
+    if (!f) return;
     char line[64] = {0};
     fgets(line, sizeof(line), f);
     fclose(f);
-    remove(cmdFile);
+    remove(CMD_FILE);
+    LOGI("command: '%s'", line);
 
-    LOGI("checkFileCommand: dapat command='%s'", line);
-
-    // Parse command
     if (strncmp(line, "clear", 5) == 0) {
         pthread_mutex_lock(&g_npcMutex);
         g_npcList.clear();
@@ -354,172 +274,74 @@ static void checkFileCommand() {
         LOGI("NPC list cleared");
         return;
     }
-
     if (strncmp(line, "spawn", 5) == 0) {
         int model  = g_spawnModel;
         int weapon = g_spawnWeapon;
-        // Parse optional: "spawn MODEL WEAPON"
         sscanf(line, "spawn %d %d", &model, &weapon);
         spawnNPC(model, weapon);
     }
 }
 
 // ============================================================
-// HOOK: CGame::Process — dipanggil tiap frame
+// HOOK: CGame::Process — tiap frame
 // ============================================================
 
 static void hookedCGameProcess() {
-    // Panggil original dulu
-    if (g_origCGameProcess) {
-        g_origCGameProcess();
-    }
+    if (g_origCGameProcess) g_origCGameProcess();
 
     g_frameCounter++;
 
-    // Cek file command setiap 30 frame (~0.5 detik)
-    if (g_frameCounter % 30 == 0) {
-        checkFileCommand();
-    }
-
-    // Monitor NPC setiap 60 frame (~1 detik)
-    if (g_frameCounter % 60 == 0) {
-        monitorNPCs();
-    }
-
-    // Reset counter agar tidak overflow
-    if (g_frameCounter >= 3600) {
-        g_frameCounter = 0;
-    }
+    if (g_frameCounter % 30  == 0) checkFileCommand();
+    if (g_frameCounter % 60  == 0) monitorNPCs();
+    if (g_frameCounter >= 3600)    g_frameCounter = 0;
 }
 
 // ============================================================
-// INIT: Cari base address libGTASA.so
-// ============================================================
-
-static uintptr_t getLibraryBase(const char* libName) {
-    char line[512];
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
-
-    uintptr_t base = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, libName) && strstr(line, "r-xp")) {
-            base = (uintptr_t)strtoul(line, nullptr, 16);
-            break;
-        }
-    }
-    fclose(f);
-    return base;
-}
-
-// ============================================================
-// HOOK: Pasang hook ke CGame::Process via inline hook sederhana
-// Kita pakai pendekatan thumb trampoline manual
-// (Dobby tidak tersedia di sini, pakai manual patch)
-// ============================================================
-
-// Untuk Thumb function: kita perlu 8-byte trampoline
-// LDR PC, [PC, #0]  (Thumb-2: 32-bit)
-// .word target_address
-
-static uint8_t g_origBytes[8];
-
-static bool hookCGameProcess() {
-    uintptr_t funcAddr = g_gtasaBase + OFF_CGame_Process;
-    // Thumb: addr & ~1, tapi kita akses memory actual tanpa +1
-    uintptr_t patchAddr = funcAddr; // OFF sudah tanpa +1
-
-    // Simpan original bytes
-    memcpy(g_origBytes, (void*)patchAddr, 8);
-
-    // Buat trampoline untuk original (6 bytes pertama + jump back)
-    // Alokasi trampoline
-    uint8_t* tramp = (uint8_t*)memalign(4, 16);
-    memcpy(tramp, g_origBytes, 8);
-
-    // Jump back ke patchAddr+8
-    uintptr_t retAddr = patchAddr + 8;
-    // LDR PC, [PC, #0] dalam Thumb-2 = F8 DF F0 00
-    tramp[8]  = 0xDF; tramp[9]  = 0xF8;
-    tramp[10] = 0xF0; tramp[11] = 0x00;
-    *(uintptr_t*)(tramp + 12) = retAddr | 1; // +1 untuk Thumb
-
-    g_origCGameProcess = (CGame_Process_t)((uintptr_t)tramp | 1);
-
-    // Patch fungsi original dengan jump ke hooked
-    // mprotect dulu agar bisa tulis
-    uintptr_t pageStart = patchAddr & ~(4095);
-    mprotect((void*)pageStart, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
-
-    uintptr_t hookAddr = (uintptr_t)hookedCGameProcess | 1; // Thumb
-    uint8_t patch[8];
-    patch[0] = 0xDF; patch[1] = 0xF8; // LDR.W PC, [PC, #0]
-    patch[2] = 0xF0; patch[3] = 0x00;
-    *(uintptr_t*)(patch + 4) = hookAddr;
-
-    LOGI("hookCGameProcess: patch di 0x%08x -> hook 0x%08x",
-         (unsigned)patchAddr, (unsigned)hookAddr);
-    memcpy((void*)patchAddr, patch, 8);
-
-    // Cache flush
-    __builtin___clear_cache((char*)patchAddr, (char*)patchAddr + 8);
-    __builtin___clear_cache((char*)tramp, (char*)tramp + 16);
-
-    LOGI("Hook CGame::Process dipasang di 0x%x", (unsigned)patchAddr);
-    return true;
-}
-
-// ============================================================
-// ENTRY POINT — dipanggil AML
+// ENTRY POINT
 // ============================================================
 
 extern "C" void OnModLoad() {
     logClear();
-    LOGI("OnModLoad dipanggil");
-    LOGI("Compiled: %s %s", __DATE__, __TIME__);
+    LOGI("OnModLoad dipanggil — build %s %s", __DATE__, __TIME__);
 
-    // Cari base libGTASA.so
-    g_gtasaBase = getLibraryBase("libGTASA.so");
+    // aml sudah tersedia dari macro MYMOD via GetInterface("AMLInterface")
+    if (!aml) {
+        LOGE("aml interface null — AML tidak ter-load dengan benar");
+        return;
+    }
+
+    // Dapatkan base libGTASA.so via AML (lebih reliable dari /proc/self/maps)
+    g_gtasaBase = aml->GetLib("libGTASA.so");
     if (!g_gtasaBase) {
         LOGE("GAGAL: base libGTASA.so tidak ditemukan");
         return;
     }
     LOGI("libGTASA.so base: 0x%08x", (unsigned)g_gtasaBase);
-    LOGI("CGame::Process addr: 0x%08x", (unsigned)(g_gtasaBase + OFF_CGame_Process));
-    LOGI("FindPlayerPed addr:  0x%08x", (unsigned)(g_gtasaBase + OFF_FindPlayerPed));
-    LOGI("AddPed addr:         0x%08x", (unsigned)(g_gtasaBase + OFF_CPopulation_AddPed));
+    LOGI("CGame::Process:   0x%08x", (unsigned)(g_gtasaBase + OFF_CGame_Process));
+    LOGI("FindPlayerPed:    0x%08x", (unsigned)(g_gtasaBase + OFF_FindPlayerPed));
+    LOGI("AddPed:           0x%08x", (unsigned)(g_gtasaBase + OFF_CPopulation_AddPed));
 
     srand(12345);
 
-    // Pasang hook
-    if (hookCGameProcess()) {
-        g_hooked = true;
-        g_initialized = true;
-        LOGI("NPCFight siap. Tulis ke /sdcard/npcfight.txt untuk spawn NPC.");
-        LOGI("Format: 'spawn [modelId] [weaponId]' atau 'clear'");
-    } else {
-        LOGE("Hook gagal");
+    // Hook CGame::Process via AML — handle Thumb, mprotect, cache flush otomatis
+    // Thumb function: pass addr+1 agar AML/GlossHook tahu ini Thumb
+    uintptr_t processAddr = g_gtasaBase + OFF_CGame_Process + 1;
+    bool ok = aml->Hook(
+        (void*)processAddr,
+        (void*)hookedCGameProcess,
+        (void**)&g_origCGameProcess
+    );
+
+    if (!ok || !g_origCGameProcess) {
+        LOGE("Hook CGame::Process GAGAL");
+        return;
     }
-}
 
-// AML mod info
-struct ModInfo {
-    const char* id;
-    const char* name;
-    const char* version;
-    const char* author;
-};
-
-extern "C" ModInfo* __GetModInfo() {
-    static ModInfo info = {
-        "com.brruham.npcfight",
-        "NPC Fight",
-        "1.0",
-        "brruham"
-    };
-    return &info;
-}
-
-extern "C" const char* __INeedASpecificGame() {
-    return "com.rockstargames.gtasa";
+    g_initialized = true;
+    LOGI("Hook OK — origFn=0x%08x", (unsigned)(uintptr_t)g_origCGameProcess);
+    LOGI("NPCFight siap. Tulis npcfight.txt untuk spawn:");
+    LOGI("  'spawn'          → COP + AK47");
+    LOGI("  'spawn 267 25'   → SWAT + Shotgun");
+    LOGI("  'spawn 287 31'   → Army + M4");
+    LOGI("  'clear'          → reset list NPC");
 }
