@@ -8,6 +8,7 @@
 #include <math.h>
 #include <vector>
 #include <stdint.h>
+#include <sys/mman.h>
 
 #define TAG "NPCFight"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
