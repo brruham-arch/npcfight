@@ -17,7 +17,7 @@
 // Untuk device tanpa root (tidak bisa baca logcat dari Termux)
 // ============================================================
 
-static const char* LOG_FILE = "/sdcard/npcfight_log.txt";
+static const char* LOG_FILE = "/storage/emulated/0/Android_unprotected/data/com.rockstargames.gtasa/files/npcfight_log.txt";
 static int g_logLine = 0;
 
 static void fileLog(const char* level, const char* fmt, ...) {
@@ -335,7 +335,7 @@ static void monitorNPCs() {
 // ============================================================
 
 static void checkFileCommand() {
-    const char* cmdFile = "/sdcard/npcfight.txt";
+    const char* cmdFile = "/storage/emulated/0/Android_unprotected/data/com.rockstargames.gtasa/files/npcfight.txt";
     FILE* f = fopen(cmdFile, "r");
     if (!f) return;
 
