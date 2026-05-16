@@ -1,0 +1,36 @@
+name: Build NPCFight
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r21e
+        add-to-path: true
+
+    - name: Build with ndk-build
+      run: |
+        cd $GITHUB_WORKSPACE
+        ndk-build NDK_PROJECT_PATH=. \
+                  APP_BUILD_SCRIPT=jni/Android.mk \
+                  NDK_APPLICATION_MK=jni/Application.mk \
+                  NDK_LIBS_OUT=./out \
+                  NDK_OUT=./obj \
+                  -j4
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: libnpcfight
+        path: out/armeabi-v7a/libnpcfight.so
