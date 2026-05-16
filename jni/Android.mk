@@ -3,7 +3,7 @@ LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE    := npcfight
-LOCAL_SRC_FILES := ../src/main.cpp
+LOCAL_SRC_FILES := main.cpp
 
 LOCAL_CPPFLAGS  := -std=c++17 -O2 -fvisibility=hidden
 LOCAL_CFLAGS    := -O2
